@@ -13,7 +13,7 @@ func setup(t *testing.T, start map[Address]uint64) *Ledger {
 	l := New()
 	for addr, amt := range start {
 		if err := l.Deposit(addr, amt); err != nil {
-			t.Fatalf("setup:deposit %d to %s:%v",amt, addr, err)
+			t.Fatalf("setup:deposit %d to %s:%v", amt, addr, err)
 		}
 	}
 	return l
@@ -27,7 +27,7 @@ func TestDeposit(t *testing.T) {
 		wantErr error
 		wantBal uint64
 	}{
-		{"new account", nil, 100,nil,100},
+		{"new account", nil, 100, nil, 100},
 		{"adds to existing", map[Address]uint64{"alice": 50}, 25, nil, 75},
 		{"zero amount rejected", map[Address]uint64{"alice": 50}, 0, ErrInvalidAmount, 50},
 		{"overflow rejected", map[Address]uint64{"alice": math.MaxUint64}, 1, ErrOverflow, math.MaxUint64},
@@ -47,7 +47,7 @@ func TestDeposit(t *testing.T) {
 
 }
 
-func testTransfer(t *testing.T) {
+func TestTransfer(t *testing.T) {
 	tests := []struct {
 		name     string
 		start    map[Address]uint64

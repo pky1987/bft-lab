@@ -120,3 +120,46 @@ func TestTransfer(t *testing.T) {
 		})
 	}
 }
+
+// FuzzTransfer checks two invariants for ANY starting balances and amount:
+//  1. atomicity:    a failed transfer changes nothing
+//  2. conservation: a successful transfer moves exactly `amount`, so supply is unchanged
+
+func FuzzTransfer(f *testing.F) {
+	//Seed corpus : starting points the fuzzer mutates from.
+	f.Add(uint64(100), uint64(0), uint64(30))            //normal
+	f.Add(uint64(100), uint64(0), uint64(101))           //insufficient funds
+	f.Add(uint64(10), uint64(math.MaxUint64), uint64(1)) //overflow attack
+	f.Add(uint64(0), uint64(0), uint64(5))               //alice doesn't exist.
+
+	f.Fuzz(func(t *testing.T, aliceStart, bobStart, amount uint64) {
+		l := New()
+		if aliceStart > 0 {
+			if err := l.Deposit("alice", aliceStart); err != nil {
+				t.Fatalf("Setup alice: %v", err)
+			}
+		}
+		if bobStart > 0 {
+			if err := l.Deposit("bob", bobStart); err != nil {
+				t.Fatalf("Setup bob: %v", err)
+			}
+		}
+		err := l.Transfer("alice", "bob", amount)
+		aliceEnd, bobEnd := l.Balance("alice"), l.Balance("bob")
+
+		if err != nil {
+			//Invariant 1: atomicity
+			if aliceEnd != aliceStart || bobEnd != bobStart {
+				t.Fatalf("failed transfer chnaged state: alice %d->%d, bob %d->%d(err=%v)", aliceStart, aliceEnd, bobStart, bobEnd, err)
+			}
+			return
+		}
+		//Invariant 2 : conservation
+		if aliceEnd > aliceStart || aliceStart-aliceEnd != amount {
+			t.Fatalf("alice lost wrong amount: %d->%d, amount%d ", aliceStart, aliceEnd, amount)
+		}
+		if bobEnd < bobStart || bobEnd-bobStart != amount {
+			t.Fatalf("bob gained wrong amount: %d->%d, amount %d", bobStart	, bobEnd, amount)
+		}
+	})
+}

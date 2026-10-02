@@ -19,3 +19,9 @@ go test -v -run FuzzTransfer ./ledger                      # 1. seeds only, fast
 go test -fuzz=FuzzTransfer -fuzztime=30s ./ledger          # 2. real fuzzing for 30 seconds
 
 ```
+## Run all at once:
+
+```
+gofmt -w . && go vet ./... && go test -race -v -cover ./...
+
+```

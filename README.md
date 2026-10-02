@@ -35,3 +35,20 @@ go test ./... 2>&1 | grep -E "FAIL|_test.go"
 go test -v -run TestMemTransportFIFO ./p2p
 
 ```
+
+## GoRoutines & Race-Condition and Mutex
+1. Without the race detector:
+   ```
+   go test -count=1 -v -run Concurrent ./p2p
+
+   ```
+2. With the race detector:
+   ```
+   go test -count=1 -race -run Concurrent ./p2p
+
+   ```
+3. Run everything with the race detector after using mutex
+```
+gofmt -w . && go vet ./... && go test -count=3 -race -v -cover ./...
+
+```

@@ -1,6 +1,6 @@
 package p2p
 
-//MemTransport is an in-memory Transport. Messages are delivered instantly.
+// MemTransport is an in-memory Transport. Messages are delivered instantly.
 type MemTransport struct {
 	inboxes map[NodeID][]Message
 }

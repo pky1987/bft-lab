@@ -124,7 +124,6 @@ func TestTransfer(t *testing.T) {
 // FuzzTransfer checks two invariants for ANY starting balances and amount:
 //  1. atomicity:    a failed transfer changes nothing
 //  2. conservation: a successful transfer moves exactly `amount`, so supply is unchanged
-
 func FuzzTransfer(f *testing.F) {
 	//Seed corpus : starting points the fuzzer mutates from.
 	f.Add(uint64(100), uint64(0), uint64(30))            //normal
@@ -159,7 +158,7 @@ func FuzzTransfer(f *testing.F) {
 			t.Fatalf("alice lost wrong amount: %d->%d, amount%d ", aliceStart, aliceEnd, amount)
 		}
 		if bobEnd < bobStart || bobEnd-bobStart != amount {
-			t.Fatalf("bob gained wrong amount: %d->%d, amount %d", bobStart	, bobEnd, amount)
+			t.Fatalf("bob gained wrong amount: %d->%d, amount %d", bobStart, bobEnd, amount)
 		}
 	})
 }

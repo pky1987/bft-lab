@@ -14,7 +14,7 @@ type Address string
 var (
 	ErrInvalidAmount     = errors.New("amount must be greater than zero")
 	ErrAccountNotFound   = errors.New("account not found")
-	ErrInsufficientFunds = errors.New("insufficient Funds")
+	ErrInsufficientFunds = errors.New("insufficient funds")
 	ErrSelfTransfer      = errors.New("cannot transfer to self")
 	ErrOverflow          = errors.New("balance overflow")
 )

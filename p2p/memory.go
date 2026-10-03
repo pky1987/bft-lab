@@ -1,7 +1,11 @@
 package p2p
 
+import "sync"
+
 // MemTransport is an in-memory Transport. Messages are delivered instantly.
+// And in order(FIFO). It is safe for concurrent used by multiple goroutines.
 type MemTransport struct {
+	mu      sync.Mutex
 	inboxes map[NodeID][]Message
 }
 
@@ -15,6 +19,8 @@ func NewMemTransport() *MemTransport {
 
 // Register adds a node so it can receive messages.
 func (m *MemTransport) Register(id NodeID) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, ok := m.inboxes[id]; !ok {
 		m.inboxes[id] = nil
 	}
@@ -22,6 +28,8 @@ func (m *MemTransport) Register(id NodeID) {
 
 // Send appends msg to receiver's inbox.
 func (m *MemTransport) Send(msg Message) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	inbox, ok := m.inboxes[msg.To]
 	if !ok {
 		return ErrUnknownNode
@@ -32,6 +40,8 @@ func (m *MemTransport) Send(msg Message) error {
 
 // Receive removes and returns the oldest message for id.
 func (m *MemTransport) Receive(id NodeID) (Message, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	inbox := m.inboxes[id]
 	if len(inbox) == 0 {
 		return Message{}, false

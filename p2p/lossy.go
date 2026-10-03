@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"math/rand/v2"
+	"sync"
 )
 
 // LossyTransport wraps another Transport and randomly drops send messages,
@@ -9,6 +10,7 @@ import (
 // the same messages, which makes failures replayable.
 
 type LossyTransport struct {
+	mu       sync.Mutex
 	inner    Transport
 	dropRate float64 // 0.0 means no drops, 1.0 means all drops.
 	rng      *rand.Rand
@@ -30,8 +32,13 @@ func NewLossyTransport(inner Transport, dropRate float64, seed uint64) *LossyTra
 // Send either drop msg ( returing nil,like a real network that loses a packet silently
 // or forwads it to the wrapped transport.)
 func (l *LossyTransport) Send(msg Message) error {
-	if l.rng.Float64() < l.dropRate {
+	l.mu.Lock()
+	drop := l.rng.Float64() < l.dropRate
+	if drop {
 		l.dropped++
+	}
+	l.mu.Unlock()
+	if drop {
 		return nil
 	}
 	return l.inner.Send(msg)
@@ -44,5 +51,7 @@ func (l *LossyTransport) Receive(id NodeID) (Message, bool) {
 
 // Dropped reports how many messages have been lost so far.
 func (l *LossyTransport) Dropped() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.dropped
 }

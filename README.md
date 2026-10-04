@@ -52,3 +52,39 @@ go test -v -run TestMemTransportFIFO ./p2p
 gofmt -w . && go vet ./... && go test -count=3 -race -v -cover ./...
 
 ```
+4. To see exactly which line has never run:
+```
+go test -coverprofile=cover.out ./p2p
+go tool cover -html=cover.out -o cover.html
+
+```
+
+5. To check only function test in test:
+
+```
+go test -count=1 -v -run ChanTransportInboxFull ./p2p
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

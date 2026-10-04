@@ -29,10 +29,10 @@ we swap implementations underneath it.
         │ Transport (iface) │   Send(msg) error
         └─────────┬─────────┘   Receive(id) (Message, bool)
                   │             (all implementations are safe for concurrent use, see §6)
-      ┌───────────┼──────────────────┐
-      ▼           ▼                  ▼
- MemTransport  LossyTransport    TCPTransport
-  (tests)      (fault injection)  (Week 3)
+      ┌───────────┼────────────────┬──────────────────┐
+      ▼           ▼                ▼                  ▼
+ MemTransport  LossyTransport   ChanTransport     TCPTransport
+  (tests)      (fault injection) (channels, §7)    (Week 3)
 ```
 
 This is **layering**: each layer does one job and knows nothing about the layers above it.
@@ -208,7 +208,7 @@ using **timeouts** (stop waiting) and **retries/re-gossip**. You'll build those 
 
 ---
 
-## 6. Concurrency: goroutines, WaitGroup, data races, mutex (Lesson 5)
+## 6. Concurrency: goroutines, WaitGroup, data races, mutex (Lesson 5 ✅)
 
 ### Why
 
@@ -343,7 +343,154 @@ go test -count=3 -race -v -run Concurrent ./p2p
 
 ---
 
-## 7. Failure models (what we'll inject over the coming weeks)
+## 7. Channels and `select`: `ChanTransport` (Lesson 6, in progress)
+
+### Why
+
+In §6 goroutines **shared** a map and took turns with a mutex. Go offers a second style, and it's the
+one CometBFT is built around:
+
+> *"Don't communicate by sharing memory; share memory by communicating."* (Go proverb)
+
+Instead of many goroutines touching the same data, one goroutine **sends** a value through a
+**channel** and another **receives** it. The channel does the synchronisation for you.
+
+Why consensus needs this: a validator constantly waits for **several things at once**: "a vote
+arrived" **or** "the round timed out" **or** "shut down". Only channels + `select` can express
+"wait for whichever happens first". A mutex can't.
+
+### Channels: the basics
+
+A channel is a typed pipe between goroutines.
+
+```go
+ch := make(chan Message)       // unbuffered: holds 0 messages
+ch := make(chan Message, 100)  // buffered:   holds up to 100 messages
+
+ch <- msg                      // SEND    (arrow points INTO the channel)
+msg := <-ch                    // RECEIVE (arrow points OUT of the channel)
+msg, ok := <-ch                // ok == false once the channel is closed and empty
+close(ch)                      // no more sends. Receivers drain what's left, then get ok == false
+```
+
+**Blocking rules (the most important thing to memorise):**
+
+| Channel | Send blocks when… | Receive blocks when… |
+|---|---|---|
+| **unbuffered** `make(chan T)` | nobody is receiving right now | nobody is sending right now |
+| **buffered** `make(chan T, n)` | the buffer is **full** (n items) | the buffer is **empty** |
+| **nil** (declared, never `make`d) | forever | forever |
+
+```
+unbuffered: a hand-to-hand handoff, where both people must be there at the same moment
+   sender ──(waits)──► 🤝 ◄──(waits)── receiver
+
+buffered (cap 3): a mailbox. The sender only waits when it's full
+   sender ──► [ m1 | m2 | m3 ] ──► receiver
+```
+
+**Channels are already goroutine-safe.** Many goroutines can send to and receive from the same channel
+with no mutex. And a channel is **FIFO**: messages from one sender come out in the order they went in.
+
+### Deadlock: the channel version of a frozen node
+
+```go
+ch := make(chan int)   // unbuffered
+ch <- 1                // nobody will ever receive, so this blocks forever
+```
+Verified output:
+```
+fatal error: all goroutines are asleep - deadlock!
+goroutine 1 [chan send]:
+```
+Go detects that **every** goroutine is stuck and kills the program. In a validator, a deadlock means
+the node stops voting, and the chain may stall.
+
+A related bug is the **goroutine leak**: one goroutine blocked forever (waiting on a channel nobody
+will ever use) while the rest of the program keeps running. No crash, just slowly growing memory.
+
+### `select`: wait for whichever happens first
+
+```go
+select {
+case msg := <-inbox:          // a message arrived
+	handle(msg)
+case <-time.After(time.Second): // or 1 second passed with nothing
+	fmt.Println("timeout")
+}
+```
+- `select` blocks until **one** case is ready, then runs **only that case**.
+- If several cases are ready, it picks one **at random** (yes, randomness again: never rely on case order).
+- With a `default` case, `select` **never blocks**: if nothing is ready, `default` runs immediately.
+
+| Pattern | Code | Used in `ChanTransport` for |
+|---|---|---|
+| **Non-blocking send** | `select { case ch <- m: ...; default: ... }` | `Send`: a full inbox returns `ErrInboxFull` instead of freezing the sender |
+| **Non-blocking receive** | `select { case m := <-ch: ...; default: ... }` | `Receive`: an empty inbox returns `false` (satisfies the `Transport` contract) |
+| **Blocking receive with timeout** | `select { case m := <-ch: ...; case <-time.After(d): ... }` | how an event loop waits on `Inbox()` (the node, next lesson) |
+
+### Directional channel types
+
+```go
+func (c *ChanTransport) Inbox(id NodeID) (<-chan Message, bool)
+```
+`<-chan Message` means **receive-only**. Whoever calls `Inbox` can read messages but **can't** send
+into or close someone else's inbox. The compiler enforces it. (`chan<- Message` is send-only.)
+It's the same idea as the lowercase `balances` field in the ledger: limit what callers can do.
+
+### Backpressure
+
+A buffered inbox has a fixed size. What should happen when a slow node's inbox is full?
+
+| Option | Problem |
+|---|---|
+| block the sender until there's room | one slow validator freezes everyone who sends to it |
+| grow the buffer forever | memory exhaustion (a **DoS** vector: an attacker floods you with messages) |
+| **reject with `ErrInboxFull`** ✅ | the sender knows immediately and can drop, retry or slow down |
+
+Refusing work you can't handle is called **backpressure**. Real nodes need it too: CometBFT's peer
+connections have bounded send queues for the same reason.
+
+### Mutex vs channel: which one, when?
+
+| Use a **mutex** when… | Use a **channel** when… |
+|---|---|
+| protecting shared **state** (a map, a counter) | passing **ownership of data** or **events** between goroutines |
+| the critical section is short | you need to **wait** for something, or for one of several things (`select`) |
+| e.g. `MemTransport.inboxes`, `LossyTransport.dropped` | e.g. node inboxes, timeouts, shutdown signals |
+
+`ChanTransport` uses **both**: an `RWMutex` guards the **map** of inboxes (which can change when
+nodes register), and the **channels** carry the messages themselves.
+
+`sync.RWMutex` is a mutex with two modes: **many readers at once** (`RLock`), or **one writer
+alone** (`Lock`). `Send`/`Receive`/`Inbox` only *read* the map, so they share `RLock`. `Register`
+*writes* it, so it takes `Lock`.
+
+### How CometBFT does it
+
+The heart of CometBFT's consensus engine (`consensus/state.go`, the `receiveRoutine`) is a single
+goroutine running a loop around **one big `select`**: peer messages, internal messages, timeout
+ticks and a quit signal. Only that goroutine changes consensus state, so most consensus logic needs
+no locks at all. You'll build the same shape in the next lesson.
+
+### Properties and the tests that will prove them
+
+| Property | Test |
+|---|---|
+| FIFO for a single sender | `TestChanTransportFIFO` |
+| unknown node → `ErrUnknownNode`. `Receive`/`Inbox` on unknown nodes → `false` | `TestChanTransportUnknownNode` |
+| full inbox → `ErrInboxFull` (backpressure). `Register` is idempotent | `TestChanTransportInboxFull` |
+| `Inbox()` can be waited on with `select` + timeout | `TestChanTransportInboxBlocking` |
+| safe under concurrent send + receive | `TestChanTransportConcurrent` |
+| safe when nodes **register** while others send | `TestChanTransportConcurrentRegister` |
+
+Verified while preparing this lesson: deleting the `RLock` in the map lookup is **not** caught by the
+send/receive tests, only by `TestChanTransportConcurrentRegister` (a data race), because only that
+test writes the map while others read it.
+
+---
+
+## 8. Failure models (what we'll inject over the coming weeks)
 
 | Fault | Real-world cause | Wrapper |
 |---|---|---|
@@ -361,7 +508,7 @@ Consensus guarantees under faults:
 
 ---
 
-## 8. Tests
+## 9. Tests
 
 ```bash
 go test -count=3 -race -v -cover ./p2p   # everything, 3×, with the race detector
@@ -373,6 +520,7 @@ go test -count=1 -v -run TestLossy ./p2p # -count=1 = ignore cached results
 | `memory_test.go` | `TestMemTransportFIFO`, `TestMemTransportEmptyInbox`, `TestMemTransportIsolation` | 100% |
 | `lossy_test.go` | `TestLossyDeterministic`, `TestLossyNeverDrops`, `TestLossyDropEverything`, `TestLossyRoughRate` | 100% |
 | `concurrent_test.go` | `TestMemTransportConcurrentSend`, `TestMemTransportConcurrentSendReceive`, `TestLossyConcurrentSend` | 100% |
+| `chan_test.go` | (Lesson 6, in progress, see §7) | — |
 
 **Break experiments:**
 - switching `Receive` to LIFO (`inbox[len(inbox)-1]`) makes `TestMemTransportFIFO` fail, which proves the test really checks order
@@ -381,7 +529,7 @@ go test -count=1 -v -run TestLossy ./p2p # -count=1 = ignore cached results
 
 ---
 
-## 9. Go lessons learned while building this package
+## 10. Go lessons learned while building this package
 
 - `if x := f(); cond { }` needs **both** parts. A missing condition gives `expected operand`
 - `:=` creates variables (at least one must be new). `=` reuses existing ones
@@ -401,7 +549,7 @@ go test -count=1 -v -run TestLossy ./p2p # -count=1 = ignore cached results
 
 ---
 
-## 10. Interview questions this package prepares you for
+## 11. Interview questions this package prepares you for
 
 1. Why does consensus code depend on an interface instead of a concrete network type?
 2. What's the decorator pattern, and how does it help fault injection?
@@ -411,6 +559,10 @@ go test -count=1 -v -run TestLossy ./p2p # -count=1 = ignore cached results
 6. What is a data race? Why is `counter++` unsafe across goroutines, and how do you detect races in Go?
 7. Why should you avoid holding a mutex while calling into another component?
 8. In a validator, what are the consequences of `fatal error: concurrent map writes`?
+9. Buffered vs unbuffered channels: when does each one block?
+10. How does `select` let a node wait for "message OR timeout OR shutdown"? What does `default` change?
+11. What is backpressure, and why is an unbounded message queue a DoS risk?
+12. When would you choose a mutex over a channel, and vice versa?
 
 ---
 

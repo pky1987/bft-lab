@@ -14,7 +14,7 @@ func TestMemTransportFIFO(t *testing.T) {
 	if !errors.Is(err, ErrUnknownNode) {
 		t.Fatalf("err=%v,want %v", err, ErrUnknownNode)
 	}
-	// Send 3 messages from alice to bobb with Payload.
+	// Send 3 messages from alice to bob with Payload.
 	for i := 0; i < 3; i++ {
 		msg := Message{From: "alice", To: "bob", Payload: []byte{byte(i)}}
 		if err := tr.Send(msg); err != nil {

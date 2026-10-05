@@ -343,7 +343,7 @@ go test -count=3 -race -v -run Concurrent ./p2p
 
 ---
 
-## 7. Channels and `select`: `ChanTransport` (Lesson 6, in progress)
+## 7. Channels and `select`: `ChanTransport` (Lesson 6 ✅)
 
 ### Why
 
@@ -484,9 +484,35 @@ no locks at all. You'll build the same shape in the next lesson.
 | safe under concurrent send + receive | `TestChanTransportConcurrent` |
 | safe when nodes **register** while others send | `TestChanTransportConcurrentRegister` |
 
-Verified while preparing this lesson: deleting the `RLock` in the map lookup is **not** caught by the
-send/receive tests, only by `TestChanTransportConcurrentRegister` (a data race), because only that
-test writes the map while others read it.
+### Results (measured on the committed code, `3c77e36`)
+
+- 6 ChanTransport tests (in `chain_test.go`), all PASS 3× under `-race`. `chan.go` is at **100%** coverage per function
+- Coverage guided the work: before `TestChanTransportInboxFull` existed, `Send` showed **83.3%**, and
+  `go tool cover -html` showed the `return ErrInboxFull` line in red. Coverage is a map of what's still untested
+- Implementation note: this version guards the map with a plain `sync.Mutex`. That's correct (no races),
+  but `sync.RWMutex` + `RLock` in `inbox()` would let lookups run in parallel
+
+**Break experiments (run on a copy of the committed code):**
+
+| Mutation | `TestChanTransportConcurrent` | `TestChanTransportConcurrentRegister` | `TestChanTransportInboxFull` |
+|---|---|---|---|
+| remove the lock in `inbox()` | ✅ passes (misses it) | ❌ **`DATA RACE`** | – |
+| make `Send` blocking (`ch <- msg`) | – | – | ❌ **hangs**: `panic: test timed out after 10s` |
+
+Why only `ConcurrentRegister` catches the missing lock: it's the only test that **writes** the map
+(`Register`) while another goroutine **reads** it (`Send` → `inbox()`). A blocking send on a full
+inbox waits forever for a receiver that never comes. Go's runtime didn't report "all goroutines are asleep"
+here because the test framework keeps other goroutines alive, so the symptom is a **hang**, caught only
+by the test timeout. In a validator, the same bug means a node freezes when one peer stops reading.
+
+**Lessons from writing these tests:**
+- copying `TestMemTransportFIFO` carried over a `To: "ghost"` → `ErrUnknownNode` check. Changing "ghost"
+  to "bob" silently reversed its meaning, **and** left an extra message in the inbox that broke the order
+  check. One test = one behaviour: if a line doesn't serve the test's sentence, delete it
+- capacity N means N sends succeed and send N+1 fails (the first draft used capacity 3 and expected the 3rd send to fail)
+- a concurrency test needs a capacity large enough that **timing can't cause failures** (`NewChanTransport(total)`),
+  otherwise it's flaky
+- `t.Errorf("Error:", err)` → vet error "call has arguments but no formatting directives": every value needs a `%v`
 
 ---
 
@@ -520,7 +546,7 @@ go test -count=1 -v -run TestLossy ./p2p # -count=1 = ignore cached results
 | `memory_test.go` | `TestMemTransportFIFO`, `TestMemTransportEmptyInbox`, `TestMemTransportIsolation` | 100% |
 | `lossy_test.go` | `TestLossyDeterministic`, `TestLossyNeverDrops`, `TestLossyDropEverything`, `TestLossyRoughRate` | 100% |
 | `concurrent_test.go` | `TestMemTransportConcurrentSend`, `TestMemTransportConcurrentSendReceive`, `TestLossyConcurrentSend` | 100% |
-| `chan_test.go` | (Lesson 6, in progress, see §7) | — |
+| `chain_test.go` | `TestChanTransportInboxBlocking`, `TestChanTransportFIFO`, `TestChanTransportUnknownNode`, `TestChanTransportInboxFull`, `TestChanTransportConcurrent`, `TestChanTransportConcurrentRegister` | 100% |
 
 **Break experiments:**
 - switching `Receive` to LIFO (`inbox[len(inbox)-1]`) makes `TestMemTransportFIFO` fail, which proves the test really checks order

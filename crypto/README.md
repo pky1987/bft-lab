@@ -157,6 +157,150 @@ func HashFields(fields ...[]byte) Hash     // unambiguous hash of several fields
 
 **Break experiment (verified):** delete the length prefix in `HashFields`, and `TestHashFieldsUnambiguous` fails with "collision".
 
+### Results (Lesson 8 ✅, committed `998df6f` on 2026-10-25)
+
+- 5 tests, 100% coverage, lint 0
+- Avalanche, `"vote:yes"` vs `"vote:yed"`: **141 of 256** bits differ (measured on the hash **bytes**)
+
+---
+
+---
+
+# Lesson 9: Ed25519 digital signatures (`sign.go`)
+
+## 9.1 Why signatures exist in consensus
+
+A hash proves **what** the data is. It says nothing about **who** sent it. In consensus, *who* matters:
+
+> "Validator X votes for block H" only counts if **X really said it**. Otherwise an attacker could flood the
+> network with fake votes "from" honest validators and fake a 2/3 majority.
+
+A **digital signature** solves this:
+
+```
+      Validator X (has a PRIVATE key, kept secret)            Everyone else (knows X's PUBLIC key)
+      ────────────────────────────────────────────            ───────────────────────────────────
+      msg = "prevote h=5 r=0 block=H"
+      sig = Sign(privateKey, msg)      ──── msg + sig ────►   Verify(publicKey, msg, sig)
+                                                                 → true:  X really signed exactly this msg
+                                                                 → false: forged, or msg/sig changed in transit
+```
+
+| Guarantee | Meaning |
+|---|---|
+| **Authenticity** | only the holder of the private key can produce a valid signature |
+| **Integrity** | changing even one bit of the message (or of the signature) makes `Verify` fail |
+| **Non-repudiation** | X can't later deny signing. This is how **double-voting** is proven and punished (evidence, topic 22) |
+
+## 9.2 Theory: public-key cryptography (the intuition)
+
+- A key pair is generated together: the **private key** (32-byte seed, secret) and the **public key** (32 bytes, shared freely)
+- **Sign** needs the private key. **Verify** needs only the public key
+- It's computationally infeasible to compute the private key from the public key, or to make a valid signature without it
+
+**Analogy:** a wax seal. Only you own the seal stamp (the private key), but anyone who knows what your seal
+looks like (the public key) can check that a letter was sealed by you, and that the seal hasn't been broken.
+
+**Why Ed25519?** It's the signature scheme CometBFT validators use by default for consensus votes:
+
+| Property | Ed25519 |
+|---|---|
+| public key / signature size | 32 bytes / 64 bytes |
+| **deterministic** signatures | same key + same message → **same** signature. No random number needed at signing time |
+| speed (measured on this machine, rough) | sign ≈ **19 µs**, verify ≈ **37 µs** |
+
+**Why "deterministic" matters:** older schemes like ECDSA need a fresh random number for **every** signature.
+If that number is ever **reused or predictable**, the private key can be computed from two signatures. That
+has caused real key thefts, including the famous PlayStation 3 signing-key break. Ed25519 derives that number from the key and the
+message, so this class of bug can't happen.
+
+## 9.3 Theory: addresses
+
+A public key is 32 bytes. Like CometBFT, we derive a shorter **address**: the first 20 bytes of SHA-256(public key).
+
+```
+private key ──► public key (32 B) ──SHA-256──► first 20 bytes ──► address (40 hex chars)
+```
+This is what the `ledger` README meant by *"on a real chain, an address is derived from a public key"*.
+Measured: seed `0x01…` → address `34750f98bd59fcfc946da45aaabe933be154a4b5`.
+
+## 9.4 Theory: what a signature does NOT protect against
+
+| Attack | Signature alone stops it? | Real defence |
+|---|---|---|
+| forged message | ✅ yes | – |
+| modified message | ✅ yes | – |
+| **replay**: re-sending an old, valid signed message | ❌ **no**, it's still a valid signature | put **height, round, chain-id** inside the signed message so it's only valid once (topic 11), or use nonces (P2/P6) |
+| **cross-context reuse**: a prevote signature accepted as a precommit | ❌ no, if both sign the same bytes | **domain separation**: include the message **type** in the signed bytes (`HashFields("prevote", …)`) |
+| stolen private key | ❌ no | key management. In P2: never commit keys, and use `.gitignore`. Production uses HSMs and remote signers |
+
+Domain separation is verified in the prototype: a signature over `HashFields("prevote", 5, blockA)` **does not**
+verify for `HashFields("precommit", 5, blockA)`.
+
+## 9.5 Theory: seeded keys for the simulator
+
+Real nodes need **random** keys (`GenerateKey`, using `crypto/rand`). But the simulator (topic 19) must be
+**reproducible**: the same seed must give the same validators every run. `NewKeyFromSeed` derives a key from a
+fixed 32-byte seed, which is the same idea as the seeded RNG in `LossyTransport`.
+
+> ⚠️ **Never use a predictable seed for a real validator.** Seeded keys are for tests and simulations only.
+> And never use `math/rand` for keys: only `crypto/rand` is secure.
+
+## 9.6 Types and functions
+
+```go
+type PublicKey  [32]byte
+type Signature  [64]byte
+type Address    [20]byte
+type PrivateKey struct { key ed25519.PrivateKey }   // field is UNEXPORTED
+
+func GenerateKey() (PrivateKey, error)               // random, for real nodes
+func NewKeyFromSeed(seed []byte) (PrivateKey, error) // deterministic. ErrBadSeed unless 32 bytes
+func (k PrivateKey) Public() PublicKey
+func (k PrivateKey) Sign(msg []byte) Signature
+func Verify(pub PublicKey, msg []byte, sig Signature) bool
+func (p PublicKey) Address() Address
+func (a Address) String() string
+```
+
+| Go concept | Where | Meaning |
+|---|---|---|
+| struct with an **unexported** field | `PrivateKey{key}` | other packages can **use** the key (`Sign`) but can't **read** the secret bytes, so it can't accidentally be printed or sent. Encapsulation as a security property, like `ledger.balances` |
+| **type assertion** `x.(T)` | `k.key.Public().(ed25519.PublicKey)` | `Public()` returns an **interface** (`crypto.PublicKey`), and `.(ed25519.PublicKey)` says "I know it's really this type, give it to me as that" |
+| **const block** | `const ( PublicKeySize = …; … )` | group related constants |
+| returning `(value, error)` | `NewKeyFromSeed` | validate input and refuse bad seeds instead of panicking (`ed25519.NewKeyFromSeed` **panics** on a wrong length) |
+| ⚠️ **unaddressable array** | `k.Public()[:]` → compile error | you can't slice an array that a function **just returned**. Store it first: `pub := k.Public(); pub[:]` |
+
+## 9.7 Properties and the tests that will prove them
+
+| Property | Test |
+|---|---|
+| a valid signature verifies. A changed message, wrong key or flipped signature bit is rejected | `TestSignVerify` |
+| same seed → same key. Different seed → different key. Same key + message → same signature | `TestDeterminism` |
+| a seed that isn't 32 bytes → `ErrBadSeed` (no panic) | `TestBadSeed` |
+| two random keys differ | `TestGenerateKeyRandom` |
+| address = SHA-256(pub)[:20], and different keys give different addresses | `TestAddress` |
+| a prevote signature can't be reused as a precommit | `TestDomainSeparation` |
+| for **any** message, a valid signature verifies and a 1-bit change is rejected | `FuzzSignVerify` |
+
+**Verified mutation:** making `Verify` always return `true` is caught by `TestSignVerify` ("tampered msg
+accepted") and `TestDomainSeparation`.
+
+## 9.8 Interview questions (signatures)
+
+1. What do digital signatures guarantee, and what do they **not** protect against?
+2. Why are Ed25519 signatures deterministic, and why is that safer than ECDSA's random nonce?
+3. How would an attacker replay a valid vote, and how does consensus prevent it?
+4. What is domain separation? Give an example from consensus.
+5. Why must `math/rand` never be used to generate keys?
+6. How is a validator address derived from its public key?
+
+## 9.9 In my own words (signatures)
+
+- A signature proves:
+- Replay is still possible because:
+- Domain separation means:
+
 ---
 
 ## 7. How this maps to CometBFT / Cosmos
@@ -164,6 +308,9 @@ func HashFields(fields ...[]byte) Hash     // unambiguous hash of several fields
 | Here | CometBFT / Cosmos |
 |---|---|
 | `crypto.Hash`, `Sum` | CometBFT `crypto/tmhash` (SHA-256) |
+| `PrivateKey.Sign` / `Verify` (Ed25519) | CometBFT `crypto/ed25519`: validators sign votes and proposals |
+| `PublicKey.Address()` = SHA-256(pub)[:20] | CometBFT validator address derivation |
+| domain separation (`"prevote"` in the signed bytes) | CometBFT signs canonical vote bytes that include type, height, round and chain-id |
 | hash chain via `prev` | `Header.LastBlockID` points at the previous block's hash |
 | `HashFields` (unambiguous encoding) | headers are hashed via a Merkle tree of **protobuf-encoded** fields: deterministic, length-delimited |
 | big-endian integers | protobuf's fixed encoding rules |

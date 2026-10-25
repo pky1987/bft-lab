@@ -43,8 +43,8 @@ func TestSumKnownVector(t *testing.T) {
 }
 
 func TestAvalanche(t *testing.T) {
-	a := Sum([]byte("vote:yes")).String()
-	b := Sum([]byte("vote:yed")).String()
+	a := Sum([]byte("vote:yes"))
+	b := Sum([]byte("vote:yed"))
 	diff := 0
 	for i := range a {
 		diff += bits.OnesCount8(a[i] ^ b[i])

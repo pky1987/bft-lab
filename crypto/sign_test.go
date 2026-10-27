@@ -98,7 +98,7 @@ func TestAddress(t *testing.T) {
 
 }
 
-func TestDomainseparation(t *testing.T) {
+func TestDomainSeparation(t *testing.T) {
 	k := seededKey(t, 1)
 	prevote := HashFields([]byte("prevote"), Uint64Bytes(5), []byte("blockA"))
 	precommit := HashFields([]byte("precommit"), Uint64Bytes(5), []byte("blockA"))

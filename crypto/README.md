@@ -286,6 +286,18 @@ func (a Address) String() string
 **Verified mutation:** making `Verify` always return `true` is caught by `TestSignVerify` ("tampered msg
 accepted") and `TestDomainSeparation`.
 
+### Results (Lesson 9 ✅, committed `0cb6db0` on 2026-10-25)
+
+- 6 signature tests written by Prakash (no fuzz test yet), all PASS. Package coverage **96.9%**: the only
+  uncovered line is the `crypto/rand` failure branch in `GenerateKey`, which can't be triggered on purpose
+- Measured: seed 7 → address `fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef`
+- **Bugs caught while writing the tests** (all the same family: the check didn't match the intent):
+  - `TestBadSeed` first called the `seededKey` helper, which always builds a **valid** seed, so it couldn't test a bad one
+  - `TestGenerateKeyRandom` used `!=` with the message "keys are equal": an inverted check that fails on correct code
+  - `TestAddress` used `h[:pub]` (an index must be an integer), the **same seed** for `other` (identical keys), `Other`
+    instead of `other`, `!=` instead of `==`, and `t.fatal` / `t.LogF` (method names are case-sensitive)
+  - Rule that came out of it: **read each `if` together with its `t.Fatal` message. They must describe the same situation**
+
 ## 9.8 Interview questions (signatures)
 
 1. What do digital signatures guarantee, and what do they **not** protect against?
@@ -300,6 +312,160 @@ accepted") and `TestDomainSeparation`.
 - A signature proves:
 - Replay is still possible because:
 - Domain separation means:
+
+---
+
+# Lesson 10: Merkle trees and inclusion proofs (`merkle.go`)
+
+## 10.1 Why Merkle trees exist
+
+A block contains many transactions. Two problems:
+
+1. **The header must commit to all of them** with one small hash, so that changing any transaction changes the block hash
+2. **A light client** (a phone wallet, or another chain in IBC) wants to know *"is my transaction in block 1000?"*
+   **without downloading the whole block**
+
+Hashing all transactions in one go (`Sum(tx0 || tx1 || …)`) solves problem 1 but not problem 2: to check it, you'd
+need every transaction. A **Merkle tree** solves both.
+
+```
+                         root = H(1 ‖ H01 ‖ H23)          ← goes in the block header (32 bytes)
+                        /                     \
+           H01 = H(1 ‖ L0 ‖ L1)        H23 = H(1 ‖ L2 ‖ L3)    ← inner nodes
+             /         \                  /         \
+     L0=H(0‖tx0)  L1=H(0‖tx1)    L2=H(0‖tx2)  L3=H(0‖tx3)      ← leaves
+```
+
+## 10.2 Inclusion proofs: proving one leaf with a few hashes
+
+To prove **tx2** is in the tree, you don't send all 4 transactions. You send tx2 plus the **siblings**
+along its path to the root, called the **aunts**:
+
+```
+proof for tx2:  aunts = [ L3, H01 ]          (bottom first)
+
+verifier:  L2  = H(0 ‖ tx2)                  ← computed from the transaction itself
+           H23 = H(1 ‖ L2 ‖ L3)              ← uses aunt #1 (sibling on the RIGHT)
+           root' = H(1 ‖ H01 ‖ H23)          ← uses aunt #2 (sibling on the LEFT)
+           root' == root from the header?  → tx2 is in the block ✅
+```
+The **index** tells the verifier whether each aunt sits on the left or the right. That's why a proof stores `Index` and `Total`.
+
+**Measured proof sizes** (number of aunts × 32 bytes):
+
+| Transactions in block | Aunts in proof | Proof size |
+|---|---|---|
+| 1 | 0 | 0 bytes |
+| 2 | 1 | 32 bytes |
+| 8 | 3 | 96 bytes |
+| 100 | 7 | 224 bytes |
+| 1,000 | 10 | 320 bytes |
+| 1,000,000 | 20 | 640 bytes |
+
+The proof grows with **log₂(n)**: a million times more transactions needs only 20 hashes. That's what makes
+light clients and cross-chain proofs practical.
+
+## 10.3 Unbalanced trees: the split rule
+
+When the number of leaves isn't a power of two, where do you split? Like CometBFT (RFC 6962), we split at
+**the largest power of two smaller than n**:
+
+```
+n = 3:  split at 2 →  [tx0 tx1] [tx2]          root = H(1 ‖ H(1‖L0‖L1) ‖ L2)
+n = 5:  split at 4 →  [tx0..tx3] [tx4]
+n = 6:  split at 4 →  [tx0..tx3] [tx4 tx5]
+```
+Each side is built the same way, **recursively**, until a side has one leaf.
+
+> **Recursion** (new Go concept): a function that calls **itself** on a smaller piece of the problem.
+> `MerkleRoot(leaves)` = `innerHash(MerkleRoot(left half), MerkleRoot(right half))`, stopping when there's 0 or 1 leaf
+> (the **base case**). Without a base case, recursion never ends.
+
+## 10.4 Security: the second-preimage attack, and why the 0x00 / 0x01 prefixes matter
+
+Without prefixes, a leaf hash is `H(tx)` and an inner hash is `H(left ‖ right)`. An attacker can take the
+64 bytes `L0 ‖ L1` and claim *"this is a single transaction"*. Its "leaf hash" `H(L0 ‖ L1)` is exactly the
+inner node H01, so a **fake transaction gets a valid proof**.
+
+The fix (RFC 6962, used by CometBFT): prefix leaves with `0x00` and inner nodes with `0x01`. Now a leaf hash
+and an inner hash can never be equal, which is the same **domain separation** idea as `"prevote"` vs `"precommit"` in Lesson 9.
+
+**Verified:** removing the prefixes makes `TestLeafInnerSeparation` fail with *"inner node accepted as leaf"*.
+
+## 10.5 What a proof verifier must reject
+
+| Attack | Defence in `Proof.Verify` |
+|---|---|
+| wrong transaction for this proof | the leaf hash changes, so the root doesn't match |
+| right transaction, wrong root (another block) | the root doesn't match |
+| wrong `Index` | aunts get combined on the wrong side, so the root doesn't match |
+| a tampered aunt | the root doesn't match |
+| too few / too many aunts | `hashFromAunts` returns `ok = false` |
+| `Index` ≥ `Total` or negative | rejected before any hashing |
+
+## 10.6 Types and functions
+
+```go
+var ErrIndexOutOfRange = errors.New("leaf index out of range")
+
+type Proof struct {
+    Index int    // which leaf
+    Total int    // how many leaves in the tree
+    Aunts []Hash // siblings from the leaf up to the root, bottom first
+}
+
+func MerkleRoot(leaves [][]byte) Hash                       // Sum(nil) for no leaves
+func MerkleProof(leaves [][]byte, index int) (Proof, error)
+func (p Proof) Verify(root Hash, leaf []byte) bool
+
+// unexported helpers: leafHash, innerHash, split, aunts, hashFromAunts
+```
+
+| Go concept | Where | Meaning |
+|---|---|---|
+| **recursion** | `MerkleRoot`, `aunts`, `hashFromAunts` | a function calling itself on a smaller input, with a base case |
+| `[][]byte` | `leaves` | a slice of byte slices: one entry per transaction |
+| `switch len(x) { case 0: … case 1: … }` | `MerkleRoot` | cleaner than `if/else if` for base cases |
+| `make([]byte, 0, 1+2*Size)` | `innerHash` | length 0, **capacity** 65, so the three `append`s never reallocate |
+| two return values `(Hash, bool)` | `hashFromAunts` | the result, plus whether the proof had the right shape |
+| `last, rest := a[len(a)-1], a[:len(a)-1]` | `hashFromAunts` | take the top aunt and the rest. Multiple assignment |
+
+## 10.7 Properties and the tests that will prove them
+
+| Property | Test |
+|---|---|
+| roots for 0, 1, 2 and 3 leaves match a hand computation | `TestMerkleRootSmall` |
+| changing **any** leaf, or swapping two, changes the root | `TestMerkleRootSensitive` |
+| for every tree size 1–17 and **every** index, the proof verifies (and logs proof sizes) | `TestProofAllIndices` |
+| wrong leaf / root / index, a tampered aunt, a short proof, out-of-range index, an extra aunt → rejected | `TestProofRejects` |
+| `MerkleProof` with index −1 or n → `ErrIndexOutOfRange` | `TestProofOutOfRange` |
+| an inner node can't be passed off as a leaf (second preimage) | `TestLeafInnerSeparation` |
+
+**Verified mutations:** removing the prefixes is caught by `TestLeafInnerSeparation`. Swapping left/right when
+rebuilding the root is caught by `TestProofAllIndices` (`n=2 i=0 rejected`).
+
+## 10.8 How this maps to CometBFT / Cosmos / IBC
+
+| Here | Real world |
+|---|---|
+| `MerkleRoot(txs)` | CometBFT `Header.DataHash` (Merkle root of the block's transactions) |
+| `Proof{Index, Total, Aunts}` | CometBFT `crypto/merkle.Proof`, which uses the same field names |
+| 0x00 / 0x01 prefixes, split at the largest power of 2 | RFC 6962, as in CometBFT's `crypto/merkle` |
+| inclusion proofs | **IBC (P3)**: chain B verifies that chain A committed a packet using Merkle proofs against A's app hash |
+
+## 10.9 Interview questions (Merkle)
+
+1. Why does a block header store a Merkle root instead of a plain hash of all transactions?
+2. How big is an inclusion proof for n transactions, and why?
+3. What is a second-preimage attack on a Merkle tree, and how do leaf/inner prefixes prevent it?
+4. Why does a proof need the leaf's index?
+5. How does IBC use Merkle proofs?
+
+## 10.10 In my own words (Merkle)
+
+- A Merkle root commits to:
+- An inclusion proof contains:
+- The 0x00/0x01 prefixes prevent:
 
 ---
 

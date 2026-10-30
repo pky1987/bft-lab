@@ -25,6 +25,10 @@ go test -fuzz=FuzzTransfer -fuzztime=30s ./ledger          # 2. real fuzzing for
 gofmt -w . && go vet ./... && go test -race -v -cover ./...
 
 ```
+
+```
+gofmt -w . && go vet ./... && go test -race -run '^TestQuorumTable$' -v -cover ./...
+```
 ## Show only the failures (filters out all the PASS lines):
 ```
 go test ./... 2>&1 | grep -E "FAIL|_test.go"

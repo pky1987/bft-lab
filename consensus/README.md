@@ -363,3 +363,192 @@ Prototype result: 6 tests, 100% coverage, `-race` clean, lint 0. `Next` with 100
 ### 9. In my own words
 
 *(Prakash writes this)*
+
+---
+
+## Lesson 14: the happy path (propose → prevote → precommit → commit)
+
+### 1. Why it exists
+
+Lessons 8–13 built the pieces: hashes, signatures, blocks, votes, vote counting and proposer selection. This
+lesson connects them, so that 4 validators commit a chain of identical blocks.
+
+```
+ Proposer            Everyone                 Everyone                  Everyone
+ ────────            ────────                 ────────                  ────────
+ PROPOSE  ──block──► PREVOTE  ──2/3+ votes──► PRECOMMIT ──2/3+ votes──► COMMIT ─► height + 1
+ "here's B"          "B looks valid to me"    "I saw 2/3+ accept B"     B is final
+```
+
+**Happy path** means every validator is online, honest and fast. Timeouts arrive in Lesson 15 and locking in
+Lesson 16, and you'll watch this version fail without them.
+
+### 2. Theory
+
+#### 2.1 Why two voting steps
+
+One round of voting isn't enough. Suppose validators committed straight after prevotes, and a node saw 2/3+
+prevotes for B while the others, because of the network, never did. That node has committed, the others
+move on and could commit a different block in the next round: a fork.
+
+- **Prevote** means *"I think B is valid."*
+- **Precommit** means *"I know 2/3+ think B is valid."*
+- **Commit** means *"I know 2/3+ know that."*
+
+The full safety argument needs the locking rule from Lesson 16. For now, remember why there are two steps:
+a commit must be backed by validators who know that the block is widely accepted.
+
+#### 2.2 The state machine
+
+```
+ enterHeight
+     │  proposer = selector.Next(); if it's me, broadcast a proposal
+     ▼
+ StepPropose ──valid proposal──► broadcast Prevote(B)
+     ▼
+ StepPrevote ──2/3+ prevotes for B──► broadcast Precommit(B)
+     ▼
+ StepPrecommit
+     │
+ (any step) ──have B and 2/3+ precommits for B──► commit B, height++, enterHeight
+```
+
+#### 2.3 A pure state machine
+
+`State` has **no goroutines, clock or network**. It only does this:
+
+```
+ message in ─► State.Handle ─► messages to broadcast
+```
+
+So tests can control every message order, one seed reproduces one run, and Lesson 19's simulator will run
+thousands of seeded runs. The same core can later sit behind the `node` event loop and a real transport.
+See [ADR 0001](../docs/adr/0001-pure-consensus-state-machine.md).
+
+A node also receives its **own** broadcasts, so its own votes get counted through the same checks as
+everyone else's.
+
+#### 2.4 Messages arrive in any order
+
+| Arrives | What the node does | Why |
+|---|---|---|
+| vote for this height, before the proposal | counts it, doesn't act | it can't commit a block it hasn't seen |
+| message for a **future** height | keeps it in `pending`, replays on entry | other nodes may simply be ahead |
+| message for an **old** height | ignores it, no error | normal on a gossip network |
+| invalid proposal | returns an error, doesn't vote | never support a bad block |
+
+Votes are checked by `VoteSet` when replayed, so a bad early message gets dropped then.
+
+#### 2.5 Checks on a proposal
+
+Round → proposer → signature → duplicate or conflict → block contents (`ValidateBasic`, chain ID, height,
+parent hash, validator set hash). Cheap checks come first, and nothing is stored until they all pass.
+
+#### 2.6 Why signing the block hash is enough
+
+The signature covers only the block hash, and the header's `TxRoot` commits to the transactions. So one
+signature protects every transaction, as long as someone checks that the transactions match `TxRoot`.
+`ValidateBasic` does that. Skip it, and a relayer could swap the transactions under a valid signature.
+
+### 3. Known gaps (on purpose, for now)
+
+| Gap | Effect | Fixed in |
+|---|---|---|
+| no timeouts or rounds | a silent proposer halts the chain forever | Lesson 15 |
+| no locking | not yet safe once rounds exist | Lesson 16 |
+| `pending` has no size limit | a Byzantine node could fill memory | Lesson 21 |
+| no real network or encoding | runs in memory, inside tests | Lesson 23 |
+| no double-sign evidence | conflicts are rejected but not recorded | Lesson 22 |
+
+### 4. Files, types and functions
+
+| Name | Meaning |
+|---|---|
+| `types.Proposal` | Height, Round, Block, Signature; `SignBytes`, `Sign`, `Verify` |
+| `consensus.Message` | one broadcast: a proposal or a vote |
+| `consensus.Step` | `StepPropose`, `StepPrevote`, `StepPrecommit` |
+| `consensus.State` | one validator's state machine |
+| `NewState`, `Start` | build it, then enter height 1 |
+| `Handle(m)` | one message in, broadcasts out |
+| `advance()` | moves forward as far as what it has seen allows |
+| `enterHeight()` | resets per-height state, proposes if it's this node's turn, replays `pending` |
+| `Height()`, `Blocks()` | read the current height and the committed chain |
+
+### 5. Invariants and tests
+
+| # | Property | Test |
+|---|---|---|
+| 1 | a proposal signature is bound to its chain, key, height, round and block | `TestProposalSignVerify` |
+| 2 | a proposal signature isn't accepted as a vote | `TestProposalAndVoteSignaturesDiffer` |
+| 3 | 4 nodes commit identical, correctly linked blocks | `TestFourNodesCommit` |
+| 4 | proposers take turns | `TestProposersTakeTurns` |
+| 5 | **agreement holds over 50 seeded shuffled delivery orders** | `TestAgreementUnderShuffledDelivery` |
+| 6 | with one silent node, the chain halts at that node's turn | `TestOneSilentNodeHaltsAtItsTurn` |
+| 7 | with 2 of 4 silent, nothing is ever committed | `TestTwoSilentNodesNeverCommit` |
+| 8 | 7 kinds of bad proposal are rejected, with no vote | `TestRejectsBadProposals` |
+| 9 | duplicates are ignored, conflicts are errors | `TestProposalDuplicateAndConflict` |
+| 10 | no precommit before 2/3+ prevotes | `TestPrecommitNeedsPrevoteQuorum` |
+| 11 | no commit without 2/3+ precommits **and** the block | `TestCommitNeedsPrecommitQuorumAndTheBlock` |
+| 12 | early messages replay, old ones are ignored | `TestEarlyAndOldMessages` |
+
+### 6. Break experiments (verified on the prototype, 2026-11-01)
+
+| # | Mutation | Caught by |
+|---|---|---|
+| 1 | proposal without its block hash in `SignBytes` | `signature accepted for a different block` |
+| 2 | proposal without chain ID in `SignBytes` | `proposal replayed on another chain` |
+| 3 | act without having the block | FourNodes-style runs: `proposer sent a different block` |
+| 4 | precommit without a prevote quorum | PrecommitNeedsPrevoteQuorum: `first proposal: out=2` |
+| 5 | commit without a precommit quorum | TwoSilent: `committed with only 2 of 4 validators alive` |
+| 6 | skip the parent check | RejectsBadProposals/wrong_parent |
+| 7 | skip the proposer check | RejectsBadProposals/wrong_proposer |
+| 8 | skip the proposal signature check | RejectsBadProposals/bad_signature |
+| 9 | drop early messages | Shuffled: `seed 1: node 0 committed only 1 blocks` |
+| 10 | never update `lastHash` | FourNodes: `block 2 does not link to its parent` |
+| 11 | keep the old proposal at a new height | `proposer sent a different block` |
+
+**One mutation that survived:** changing the proposal's domain tag to `"bft-lab/vote"` fails no test, because
+a vote's signed fields already differ from a proposal's (votes include a type byte). So the tag is a second
+layer of protection here, and no test proves it on its own. That's a good reminder that 100% coverage doesn't
+mean every line is proven.
+
+Prototype result: 100% coverage for `consensus` and `types`, `-race` clean, lint 0 issues on those packages.
+
+### 7. How it maps to CometBFT
+
+| bft-lab | CometBFT |
+|---|---|
+| `State` | `consensus/state.go` `State` |
+| `Handle` | `handleMsg` inside `receiveRoutine` |
+| `enterHeight` | `updateToState` + `enterNewRound` |
+| `propose` | `enterPropose` / `defaultDecideProposal` |
+| `advance` | `enterPrevote`, `enterPrecommit`, `enterCommit` |
+| own broadcasts delivered to self | `internalMsgQueue` |
+| `pending` | peers re-gossip instead, so CometBFT doesn't need this buffer |
+
+CometBFT mixes its state machine with a timeout ticker, but it replays from a WAL and its tests drive it
+message by message, which is the same idea as our pure core.
+
+### 8. Go lessons
+
+- **`iota`:** numbers constants 0, 1, 2 within a `const` block.
+- **Optional fields with pointers:** in `Message`, `nil` means "not this kind".
+- **`if` with an init statement and `&&`:** `if h, ok := f(); ok && h == hash`.
+- **Returning a slice of effects** instead of doing I/O keeps logic testable.
+- **Function values as dependencies:** `txs func() [][]byte` lets tests supply transactions now and a mempool later.
+- **`*testing.T` helpers and fixtures** keep long tests readable.
+
+### 9. Interview questions
+
+1. Walk through one Tendermint height with 4 validators. How many messages are sent?
+2. Why two voting rounds instead of one?
+3. Why can't a node commit with 2/3+ precommits if it doesn't have the block?
+4. What happens to the chain if the proposer is offline? (Lesson 15 fixes it.)
+5. What does a pure state machine make possible for testing?
+6. Why does a validator deliver its own votes to itself?
+7. How does signing a single block hash protect every transaction?
+8. What's the risk in buffering future-height messages?
+
+### 10. In my own words
+
+*(Prakash writes this)*

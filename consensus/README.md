@@ -228,3 +228,138 @@ gossip optimisation matters.
 ### 10. In my own words
 
 *(Prakash writes this)*
+
+---
+
+## Lesson 13: proposer selection (weighted round-robin)
+
+### 1. Why it exists
+
+Each round, exactly one validator proposes a block. Every node must work out **who** on its own, with no
+messages, or they would need consensus just to run consensus. A validator with more stake should also
+propose proportionally more often, and a small validator must never be locked out.
+
+```
+ ValidatorSet ─► ProposerSelector.Next() ─► Validator
+                                               │
+              Lesson 14: "am I the proposer this round?" yes → build and send a block
+                                                         no  → wait for that validator's block
+```
+
+### 2. Theory
+
+#### 2.1 Why the simple options fail
+
+| Option | Problem |
+|---|---|
+| `height % n` | ignores stake: power 1 and power 1000 propose equally often |
+| Random, each node separately | nodes disagree about the proposer |
+| Hash of the previous block | whoever builds that block can grind it to pick the next proposer |
+
+#### 2.2 The algorithm
+
+Think of a queue where everyone earns credit at the rate of their stake, and taking a turn costs the whole pot:
+
+1. Everyone adds their **power** to their priority.
+2. The **highest priority** proposes. On a tie, the lowest address wins.
+3. The winner subtracts the **total power**.
+
+Measured with powers A=1, B=2, C=3 (total 6):
+
+| Step | Proposer | Priorities after (A, B, C) |
+|---|---|---|
+| 1 | C | 1, 2, −3 |
+| 2 | B | 2, −2, 0 |
+| 3 | A | −3, 0, 3 |
+| 4 | C | −2, 2, 0 |
+| 5 | B | −1, −2, 3 |
+| 6 | C | 0, 0, 0 |
+
+In one cycle of 6 steps: C 3 times, B 2, A 1, exactly their power, and the state is back to all zeros.
+
+#### 2.3 Why the sum stays zero
+
+Each step adds the total (everyone's power) and subtracts the total (the winner pays). So priorities always
+sum to 0. A high priority means someone else is below zero, which is why nobody can run away forever.
+
+#### 2.4 Determinism
+
+Everything here is a pure function of the validator set: `ValidatorSet` is sorted, the tie-break is fixed, and
+there's no clock, map iteration or randomness. **A slice, not a map, holds the priorities**, because Go randomises
+map order (Lesson 1) and different nodes could then break ties differently. Nodes that disagree on the
+proposer reject each other's blocks.
+
+#### 2.5 The int64 limit
+
+Priorities go negative, so they need a **signed** type, while powers are uint64. `int64(v.Power)` of a
+huge value would wrap to a negative number, so `NewProposerSelector` rejects sets above
+`MaxTotalPower = MaxInt64/8`, the same limit CometBFT uses.
+
+#### 2.6 What we skip on purpose
+
+CometBFT also rescales and re-centres priorities because its validator set **changes** over time. Our set
+is fixed in P1, so we don't need that yet. You'll meet validator-set changes in P2.
+
+The proposer is also **public in advance**. An attacker can target the next proposer with a DoS, and the
+round timeout from Lesson 15 limits the damage: if the proposer is silent, the next round picks another.
+
+### 3. Types and functions
+
+| Name | Meaning |
+|---|---|
+| `ProposerSelector` | `vals` (sorted), `priority` (same indexes), `total` |
+| `NewProposerSelector(set)` | starts all priorities at 0; `ErrPowerTooLarge` above the cap |
+| `Next()` | runs one step and returns the proposer; 0 allocations |
+
+### 4. Invariants and tests
+
+| # | Property | Test |
+|---|---|---|
+| 1 | equal power gives plain round-robin in address order | `TestProposerEqualPowerRoundRobin` |
+| 2 | over N cycles, each is chosen exactly N × power times | `TestProposerFairShare` |
+| 3 | two selectors always agree | `TestProposerDeterministic` |
+| 4 | priorities sum to 0 and stay within ±total | `TestProposerPrioritySumsToZero` |
+| 5 | power 1 next to power 1000 still proposes each cycle | `TestProposerNoStarvation` |
+| 6 | sets above the cap are rejected; the cap itself is allowed | `TestProposerRejectsHugePower` |
+
+### 5. Break experiments (verified on the prototype, 2026-10-31)
+
+| # | Mutation | Caught by |
+|---|---|---|
+| 1 | winner doesn't pay | RoundRobin, FairShare, SumsToZero, NoStarvation |
+| 2 | add 1 instead of power | FairShare (`power 1 chosen 400 times, want 100`), SumsToZero |
+| 3 | `>` → `>=` in `Next` (tie goes to the highest address) | RoundRobin |
+| 4 | remove the cap check | RejectsHugePower |
+| 5 | `>` → `>=` in the cap check | RejectsHugePower (`limit itself rejected`) |
+
+Prototype result: 6 tests, 100% coverage, `-race` clean, lint 0. `Next` with 100 validators: about 125 ns/op,
+0 allocs/op (one rough run on this laptop).
+
+### 6. How it maps to CometBFT
+
+| bft-lab | CometBFT |
+|---|---|
+| `priority[i]` | `Validator.ProposerPriority` |
+| `Next` | `ValidatorSet.IncrementProposerPriority` |
+| `MaxTotalPower` | `MaxTotalVotingPower = MaxInt64 / 8` |
+| (skipped) | `RescalePriorities`, `shiftByAvgProposerPriority` |
+
+### 7. Go lessons
+
+- **Parallel slices:** `priority[i]` belongs to `vals[i]`, kept in step by index.
+- **Signed vs unsigned:** use `int64` when a value can go negative, and guard the conversion from `uint64`.
+- **`Validators()` returns a clone** (Lesson 11), so the selector can't damage the set.
+- **Untyped constants:** `MaxTotalPower` has no fixed type, so it compares directly with a `uint64`.
+
+### 8. Interview questions
+
+1. Walk through weighted round-robin with powers 1, 2, 3.
+2. Why must proposer selection be deterministic? What happens if two nodes disagree?
+3. Why is the sum of priorities always 0?
+4. Why not choose the proposer from the previous block's hash?
+5. Why does a predictable proposer create a DoS risk, and what limits the damage?
+6. Why does CometBFT rescale priorities, and why don't we need to?
+
+### 9. In my own words
+
+*(Prakash writes this)*

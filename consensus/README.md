@@ -459,6 +459,7 @@ signature protects every transaction, as long as someone checks that the transac
 | `pending` has no size limit | a Byzantine node could fill memory | Lesson 21 |
 | no real network or encoding | runs in memory, inside tests | Lesson 23 |
 | no double-sign evidence | conflicts are rejected but not recorded | Lesson 22 |
+| `Handle(Message{})` panics | an empty message dereferences a nil `Vote`; a network must validate input first | Lesson 23 |
 
 ### 4. Files, types and functions
 
@@ -491,28 +492,35 @@ signature protects every transaction, as long as someone checks that the transac
 | 11 | no commit without 2/3+ precommits **and** the block | `TestCommitNeedsPrecommitQuorumAndTheBlock` |
 | 12 | early messages replay, old ones are ignored | `TestEarlyAndOldMessages` |
 
-### 6. Break experiments (verified on the prototype, 2026-11-01)
+### 6. Break experiments (run on the real code, 2026-11-02)
 
 | # | Mutation | Caught by |
 |---|---|---|
-| 1 | proposal without its block hash in `SignBytes` | `signature accepted for a different block` |
-| 2 | proposal without chain ID in `SignBytes` | `proposal replayed on another chain` |
-| 3 | act without having the block | FourNodes-style runs: `proposer sent a different block` |
-| 4 | precommit without a prevote quorum | PrecommitNeedsPrevoteQuorum: `first proposal: out=2` |
-| 5 | commit without a precommit quorum | TwoSilent: `committed with only 2 of 4 validators alive` |
-| 6 | skip the parent check | RejectsBadProposals/wrong_parent |
-| 7 | skip the proposer check | RejectsBadProposals/wrong_proposer |
-| 8 | skip the proposal signature check | RejectsBadProposals/bad_signature |
-| 9 | drop early messages | Shuffled: `seed 1: node 0 committed only 1 blocks` |
-| 10 | never update `lastHash` | FourNodes: `block 2 does not link to its parent` |
-| 11 | keep the old proposal at a new height | `proposer sent a different block` |
+| 1 | proposal without its block hash in `SignBytes` | `proposal verified after block header height changed` |
+| 2 | proposal without chain ID in `SignBytes` | `proposal verified with another chain` |
+| 3 | act without having the block | Shuffled: `proposer sent a different block` |
+| 4 | precommit without a prevote quorum | DuplicateAndConflict: `first proposal: out=2`, PrecommitNeedsPrevoteQuorum |
+| 5 | commit without a precommit quorum | TwoSilent: `node 0: expected 0 blocks, got 2` |
+| 6 | skip the parent check | RejectsBadProposals: `err=<nil>, want proposed block is invalid` |
+| 7 | skip the proposer check | RejectsBadProposals: `err=proposal signature is bad` instead of the proposer error |
+| 8 | skip the proposal signature check | RejectsBadProposals: `err=<nil>, want proposal signature is bad` |
+| 9 | drop early votes | Shuffled: `seed 2: node 0 has only 3 blocks` |
+| 10 | never update `lastHash` | FourNodes: `block 2 has incorrect PrevHash` |
+| 11 | keep the old proposal at a new height | FourNodes: `proposer sent a different block` |
+| 12 | swap `==` for `!=` in the duplicate check (a real typing bug, found in review) | DuplicateAndConflict: `duplicate proposal: ... proposer sent a different block` |
+| 13 | skip `ValidateBasic` | RejectsBadProposals: `err=<nil>, want proposed block is invalid` |
+
+**Honest-only tests miss quorum bugs:** with mutation 5, `TestFourNodesCommit` alone still passes, because honest
+nodes agree anyway. Only a test with silent nodes exposes it. With mutation 12, every agreement test still
+passes too, so only the test aimed at equivocation catches it.
 
 **One mutation that survived:** changing the proposal's domain tag to `"bft-lab/vote"` fails no test, because
 a vote's signed fields already differ from a proposal's (votes include a type byte). So the tag is a second
 layer of protection here, and no test proves it on its own. That's a good reminder that 100% coverage doesn't
 mean every line is proven.
 
-Prototype result: 100% coverage for `consensus` and `types`, `-race` clean, lint 0 issues on those packages.
+Real result (2026-11-02): 100% coverage for `consensus` and `types`, `-race` clean. Lint has 1 issue in the repo,
+the older `ErrBadSeed` message in `crypto/sign.go`, and none in these packages.
 
 ### 7. How it maps to CometBFT
 

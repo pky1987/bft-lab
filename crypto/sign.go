@@ -16,7 +16,7 @@ const (
 )
 
 // ErrBadSeed is returned when a seed is not exactly SeedSie bytes.
-var ErrBadSeed = errors.New("Seed must be 32 bytes")
+var ErrBadSeed = errors.New("seed must be 32 bytes")
 
 // PublicKey identifies a validator. Anyone may see it.
 type PublicKey [PublicKeySize]byte
